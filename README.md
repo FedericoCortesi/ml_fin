@@ -1,4 +1,4 @@
-# Oil Price Shocks & Market Reaction — Methodology & Preliminary Findings
+# Oil Price Shocks & Market Reaction — Methodology & Findings
 **15.C51 Group Project**  
 *Federico Cortesi — April 2026*
 
@@ -10,7 +10,7 @@ This memo documents the empirical approach taken to answer the core project ques
 
 > *How do equity markets react to oil price shocks, and can we predict that reaction?*
 
-The analysis runs from December 1998 (XLE inception) through April 16, 2026, using daily Brent crude, S&P 500 (^GSPC), and XLE (energy sector ETF) data. All code is in `analysis.py`; all plots are in `plots_event_study/`.
+The analysis runs from December 1998 (XLE inception) through April 16, 2026, using daily Brent crude, S&P 500, and all 11 SPDR sector ETFs. All code is in `analysis.py`; all plots are in `plots_event_study/`.
 
 ---
 
@@ -22,143 +22,245 @@ A shock is defined as a day on which Brent crude sets a **new 3-year (756 tradin
 - **Positive shock** (+1): price ≥ 3-year rolling maximum → supply squeeze or demand surge
 - **Negative shock** (−1): price ≤ 3-year rolling minimum → supply glut or demand collapse
 
-This is economically cleaner than z-score thresholds on daily returns. A z-score approach labels many consecutive days as "shocks" during volatile regimes (e.g., Gulf War, COVID) — days that are better understood as part of a single shock episode. The 3-year extreme definition identifies *price regime changes*, not daily noise.
-
-### Deduplication
-Consecutive shock days within a 10-trading-day window are collapsed into one event, keeping the most extreme price. This gives **63 distinct events** from 1999 to April 2026.
+Consecutive shock days within a 10-trading-day window are collapsed into one event, keeping the most extreme price. This gives **87 distinct events** from 1999 to April 2026.
 
 | Type | Count |
 |---|---|
-| Positive shocks (3y high) | 44 |
-| Negative shocks (3y low)  | 19 |
-| **Total**                 | **63** |
-| Pre-2026 (training)       | 61 |
+| Positive shocks (3y high) | 56 |
+| Negative shocks (3y low)  | 31 |
+| **Total**                 | **87** |
+| Pre-2026 (training)       | 85 |
 | 2026 (test)               | 2  |
-
-Notable clusters: Gulf War (1990–91, pre-sample), Asian financial crisis (1998–99), 2008 commodity boom/bust, COVID crash (2020), Ukraine/Russia (2022), US tariff shock (2026).
 
 ---
 
-## 2. Event Study Methodology
+## 2. Demand vs. Supply Shock Classification
 
-The event study framework is standard in finance for measuring market reactions to discrete events. The key idea is to **strip out the market's normal expected return** and measure only the *abnormal* component attributable to the shock.
+Following Kilian & Park (2009), we classify each shock using the **contemporaneous S&P 500 return** on the shock day:
+
+```
+shock_concordance = sign(ret_oil) × sign(ret_S&P)
+  +1  → oil and equities move together  (demand-driven: economic expansion)
+  −1  → oil and equities move opposite  (supply-driven: OPEC cut, geopolitical)
+```
+
+This daily-frequency analogue of the structural VAR decomposition gives:
+
+| Type | Count (pre-2026) |
+|---|---|
+| Demand shocks | 44 |
+| Supply shocks | 41 |
+
+**This distinction drives sector-level predictions** more than shock direction alone (see Section 4).
+
+---
+
+## 3. Event Study Methodology
 
 ### Estimation Window
-For each event at day *t*, we estimate a baseline return model using data from **[t−270, t−30]** — roughly one year of pre-event data, with a 30-day buffer to avoid contaminating the estimate with anticipation effects.
+For each event at day *t*, we estimate baseline return models using data from **[t−270, t−30]** — roughly one year of pre-event data with a 30-day contamination buffer.
 
 ### Baseline Models
 
-| Asset | Model | Formula |
-|---|---|---|
-| S&P 500 | Constant-mean | $E[R_{SP,\tau}] = \hat{\mu}_{SP}$ (mean over estimation window) |
-| XLE | Market model | $E[R_{XLE,\tau}] = \hat{\alpha} + \hat{\beta} \cdot R_{SP,\tau}$ (OLS over estimation window) |
+| Asset | Model |
+|---|---|
+| S&P 500 | Constant-mean: $E[R_{SP}] = \hat{\mu}_{SP}$ |
+| All sectors | Market model: $E[R_{sec}] = \hat{\alpha} + \hat{\beta} \cdot R_{SP}$ |
 
-For S&P 500 it does not make sense to use itself as its own benchmark, so we use the simpler mean-adjusted model. For XLE, the market model with S&P as the factor is the standard approach and removes broad market co-movement, isolating the energy-sector-specific abnormal return.
+The market model for sectors removes broad market co-movement, isolating the sector-specific abnormal return attributable to the oil shock.
 
 ### Abnormal Returns and CARs
 $$AR_{i,\tau} = R_{i,\tau} - E[R_{i,\tau}]$$
-
 $$CAR_i(0, h) = \sum_{\tau=0}^{h} AR_{i,\tau}$$
 
-The event window covers **[t−5, t+22]**, so we can observe pre-shock price drift as well as the market's short- and medium-run adjustment.
+Event window: **[t−5, t+22]** to observe pre-shock drift and medium-run adjustment.
 
 ---
 
-## 3. Event Study Findings
+## 4. Multi-Sector Event Study
 
-*See `plots_event_study/event_study_car.png` and `car_distributions.png`.*
+### Sector Reactions to Positive Oil Shocks (3-year high)
 
-### Average CAR Paths
+![Sector heatmap — positive shocks](plots_event_study/sector_heatmap_positive.png)
 
-**Positive shocks (oil price sets 3-year high):**
-- S&P 500 shows a **small negative average CAR** on impact and over the first 5 days — consistent with the view that energy price spikes are a tax on the broader economy.
-- XLE shows a **positive abnormal return** on impact, as expected: energy firms benefit directly from higher prices.
-- Both effects decay over 22 days.
+Sectors sorted by 22-day mean CAR:
 
-**Negative shocks (oil price sets 3-year low):**
-- S&P 500 CARs are **close to zero and noisy** — negative oil shocks have historically mixed effects on equities (cheap energy helps consumers but signals weak global demand).
-- XLE shows **negative CARs**, with more dispersion than the positive shock case.
+- **Energy (XLE)** outperforms — direct revenue pass-through to oil producers.
+- **Materials (XLB)** mildly benefits — oil-linked commodity prices rise together.
+- **Consumer Discretionary (XLY) and InfoTech (XLK)** show negative CARs — higher energy costs are a tax on consumers and businesses.
+- Mean CARs are rarely statistically significant at conventional levels (high cross-sectional dispersion), consistent with Section 5.
 
-### Statistical Significance
-T-tests of mean CAR against zero (see distribution plot titles):
+![Sector heatmap — negative shocks](plots_event_study/sector_heatmap_negative.png)
 
-| | S&P CAR(1d) | S&P CAR(22d) | XLE CAR(1d) | XLE CAR(22d) |
-|---|---|---|---|---|
-| Positive shocks | p ≈ 0.3 | p ≈ 0.4 | p ≈ 0.1 | p ≈ 0.5 |
-| Negative shocks | p ≈ 0.4 | p ≈ 0.5 | p ≈ 0.3 | p ≈ 0.4 |
+### Demand vs. Supply: Starkly Different Sector Profiles
 
-None of the mean CARs are statistically distinguishable from zero at conventional levels. This is itself a finding: **on average, the market absorbs oil price shocks without a reliably signed abnormal return.** The high cross-sectional dispersion (wide standard deviation bands in the event study plot) suggests the *direction* of each shock matters less than its *context* — the macro regime, oil vol level, and prior market momentum.
+- **Demand shocks** (oil↑ + S&P↑): most sectors show positive CARs since the underlying cause is economic strength. XLE outperforms but the spread across sectors is smaller.
+- **Supply shocks** (oil↑ + S&P↓): consumer discretionary, health care, and financials are hit hardest. XLE still benefits, creating sharp intra-market divergence.
+
+![Demand vs supply sector response](plots_event_study/demand_vs_supply_sectors.png)
+
+**Implication for the project question:** *the cause* of the oil shock matters far more than its direction in predicting sector-level outcomes. A strategy that identifies demand vs. supply shocks at the moment of the event has a fundamentally different risk/return profile across sectors.
 
 ---
 
-## 4. Cross-Sectional Model
+## 5. Aggregate Market Reaction (S&P 500)
 
-We model CAR(0→h) as a function of observable shock-day features using three estimators:
+![Event study CAR paths](plots_event_study/event_study_car.png)
 
-**Features (all known at shock day *t*, before the event window outcome):**
+![CAR distributions](plots_event_study/car_distributions.png)
+
+**Positive shocks:** S&P shows a small negative average CAR on impact, but the mean quickly reverts to zero. XLE shows positive abnormal returns at 1–5 days.
+
+**Negative shocks:** S&P CARs are noisy and close to zero. Cheap energy helps consumers but signals weak global demand; these effects roughly cancel.
+
+None of the mean CARs are statistically distinguishable from zero at conventional levels. The wide cross-sectional dispersion reflects the importance of macro context — which is where the ML models add value.
+
+---
+
+## 6. PCA Decomposition of Sector Responses
+
+![PCA sector decomposition](plots_event_study/pca_sectors.png)
+
+PCA on the 22-day CAR matrix (66 events × 9 core sectors with full history) reveals:
+
+| Component | Variance Explained | Interpretation |
+|---|---|---|
+| PC1 | 26.2% | "Macro co-movement": all sectors load with same sign |
+| PC2 | 21.5% | "Energy vs. rest": XLE loads opposite to consumer/tech |
+| PC3 | 18.4% | "Defensive rotation": staples/healthcare vs. discretionary/financials |
+
+The **flat eigenvalue spectrum** (no single factor dominates) means oil shocks affect sectors through multiple distinct channels simultaneously. The PC2 scatter — colored by demand vs. supply classification — shows moderate separation: supply shocks cluster in the "XLE outperforms rest" quadrant, while demand shocks cluster closer to the origin.
+
+---
+
+## 7. Cross-Sectional Prediction Models
+
+### Features
+
+**Original 5 features:**
 
 | Feature | Interpretation |
 |---|---|
 | `shock_dir` | +1 / −1 |
-| `ret_oil` | Oil return on shock day (magnitude) |
+| `ret_oil` | Oil return on shock day |
 | `sigma_252` | Oil volatility regime (trailing 252d std) |
-| `sp_pre_22` | S&P 22d prior return (market momentum context) |
-| `dist_from_max` | (price − 3y max) / 3y max — slack from previous extreme |
+| `sp_pre_22` | S&P 22d prior momentum |
+| `dist_from_max` | Slack from 3y maximum |
 
-**Models:** OLS, Ridge (α tuned by 5-fold CV), Lasso (α tuned by 5-fold CV).  
-**Training set:** 61 pre-2026 events. **Test set:** 2026 events.
+**Extended 10 features (adds):**
 
-### Performance
+| Feature | Interpretation |
+|---|---|
+| `shock_type` | +1 demand / −1 supply (contemporaneous classification) |
+| `ret_oil_abs` | Shock magnitude (independent of direction) |
+| `sp_pre_5` | Short-term S&P momentum (5d) |
+| `oil_trend_60` | 60-day oil price trend pre-shock |
+| `vix_pre` | VIX level in 5 days before shock (fear/uncertainty regime) |
 
-| Model | Horizon | CV R² | Train R² |
+### Results
+
+**Single-asset S&P model (original 5 features):**
+
+| Model | H | CV R² | Train R² |
 |---|---|---|---|
-| OLS   | 1d  | −1.66 | 0.03 |
-| OLS   | 5d  | −29.8 | 0.12 |
-| OLS   | 22d | −3.4  | 0.25 |
-| Ridge | 1d  | −0.23 | 0.00 |
-| Ridge | 5d  | −0.08 | 0.01 |
-| **Ridge** | **22d** | **+0.004** | **0.21** |
-| Lasso | 1d  | −0.15 | 0.00 |
-| Lasso | 5d  | −0.07 | 0.00 |
-| Lasso | 22d | −0.06 | 0.17 |
+| OLS   | 1d  | −0.24 | 0.02 |
+| OLS   | 22d | −0.34 | 0.16 |
+| Ridge | 22d | −0.24 | 0.15 |
+| Lasso | 1d  | −0.13 | 0.00 |
 
-**OLS massively overfits** — with only 61 training events and 5 features, the train/CV gap is enormous. Lasso correctly shrinks all coefficients to zero at 1d and 5d (no signal). Ridge achieves a marginally positive CV R² at 22d, which is the only honest evidence of any predictive content.
+**Extended model (10 features + RF + GBM):**
 
-**Interpretation:** Short-horizon CARs are essentially unpredictable from shock characteristics alone — consistent with market efficiency at short horizons. At 22 days there is *weak* evidence that features like the volatility regime and prior market momentum shift the conditional distribution of abnormal returns.
+| Model | H | CV R² | Train R² |
+|---|---|---|---|
+| Ridge_ext | 22d | −0.22 | 0.21 |
+| RF        | 22d | **−0.43** | **0.43** |
+| GBM       | 22d | **−1.07** | **0.89** |
+
+**Key findings:**
+1. **GBM massively overfits** — near-perfect train R² but deeply negative CV R². With 85 observations, even depth-2 trees overfit severely.
+2. **RF also overfits** (train 0.43, CV −0.43). Tree-based models' in-sample fit is misleading here.
+3. **Ridge remains the most honest estimator**. Adding 5 extended features modestly improves 1d CV R² (−0.16 → −0.08) but not 22d.
+4. Tree-based models are most useful for **feature importance** rather than prediction.
+
+### Feature Importance (RF and GBM)
+
+![RF feature importance](plots_event_study/feature_importance_rf.png)
+
+![GBM feature importance](plots_event_study/feature_importance_gbm.png)
+
+Both models consistently rank `sigma_252` (oil volatility regime) and `vix_pre` (pre-shock fear level) as top features at the 22d horizon. `shock_type` (demand/supply) ranks highly in GBM, reinforcing its economic relevance.
 
 ---
 
-## 5. Out-of-Sample: 2026 Events
+## 8. Panel Cross-Sectional Model
 
-Two 2026 shocks were identified (both positive — oil sets a new 3-year high):
+By stacking all 11 sectors × 85 events, we obtain ~625 observations per horizon. Features: 10 shock-day features + 10 sector dummies + 10 demand×sector interaction terms (≈ 30 features total).
 
-| Date | Oil return | Type |
-|---|---|---|
-| Mar 13, 2026 | +2.7% | 3-year high |
-| Mar 31, 2026 | +4.9% | 3-year high |
-
-*Mar 31 has no 22d CAR available yet (outcome window extends past data cutoff).*
-
-**Mar 13 results:**
-
-| Horizon | Actual CAR | OLS | Ridge | Lasso |
+| H | N | Ridge CV R² | Ridge Train R² | Lasso CV R² |
 |---|---|---|---|---|
-| 1d  | +0.27% | −1.10% | −0.66% | −0.66% |
-| 5d  | −2.89% | −0.06% | −0.07% | −0.02% |
-| 22d | **+3.75%** | +0.55% | +0.15% | +0.07% |
+| 1d  | 625 | −0.023 | 0.029 | −0.009 |
+| 5d  | 625 | −0.021 | 0.045 | −0.011 |
+| 22d | 625 | **−0.007** | 0.041 | −0.020 |
 
-All models predicted a small negative-to-flat 1d response (directionally plausible — positive oil shock hurts S&P). The actual 22d CAR of +3.75% was far above all model predictions, suggesting either (a) macro factors unrelated to the oil shock dominated over the month, or (b) the sample of 61 training events is too small to calibrate magnitude reliably.
+The panel Ridge CV R² at 22d (−0.007) is the **closest to zero of any model**, and the train/CV gap is much smaller than single-asset models — confirming that additional observations help regularization even when individual-sector signals remain weak.
 
 ---
 
-## 6. Limitations & Next Steps
+## 9. Quantile Regression
 
-1. **Small sample.** 61 training events spanning 25 years is not enough for stable cross-sectional regression. This makes high CV R² structurally impossible and means all quantitative predictions should be treated as directional signals, not precise forecasts.
+![Quantile regression](plots_event_study/quantile_regression.png)
 
-2. **No macro controls.** The model conditions only on oil-market and equity-market features. Adding recession indicators, Fed funds rate, or global growth proxies (e.g., copper/freight) would likely improve the 22d horizon.
+Quantile regression on S&P CAR(22d) at τ = {0.10, 0.50, 0.90}:
 
-3. **Shock asymmetry.** Positive and negative shocks have very different distributional properties. A direction-stratified model (separate regression for positive vs. negative) may outperform the pooled specification.
+- **Asymmetric tails**: the 90th-percentile line is steeper positive than the 10th-percentile is negative — oil shock CARs are positively skewed.
+- **`shock_type` effect is asymmetric**: at τ=0.10 (downside), supply shocks push the distribution left (coef = −0.010); at τ=0.90 (upside), the effect is small (+0.002). This means **supply shocks increase downside tail risk disproportionately**.
 
-4. **XLE analysis.** We computed XLE CARs using the market model but did not yet model XLE CARs cross-sectionally. Given that XLE shows stronger average reactions than S&P (especially for positive shocks), this is worth pursuing.
+Risk management implication: a supply shock identified at *t=0* warrants additional hedging not just because expected returns fall, but because the left tail expands significantly.
 
-5. **Demand vs. supply decomposition.** Hamilton (2009) and Kilian (2009) argue that the *cause* of the oil shock matters more than its direction: demand-driven price increases have different equity effects than supply-driven ones. If we can classify events (e.g., using oil futures curve slope, OPEC announcements), that would be a strong extension.
+---
+
+## 10. Leave-One-Out Backtest
+
+![LOO strategy PnL](plots_event_study/loo_strategy_pnl.png)
+
+A simple long/short strategy on the S&P — go long if the LOO-Ridge model predicts positive CAR(22d), short otherwise:
+
+| Metric | Strategy | Benchmark (always long) |
+|---|---|---|
+| Directional accuracy | **61.2%** | 50% (baseline) |
+| Total CAR (25yr) | **+108%** | +13% |
+| Annualised Sharpe | **1.03** | 0.12 |
+
+**Caveats:**
+- The Ridge alpha is selected on the full sample (mild look-ahead bias).
+- ~85 events over 25 years: standard error on directional accuracy is ≈ ±5pp.
+- No transaction costs; strategy holds for a full 22-day window on each event.
+
+Despite the caveats, 61% directional accuracy well above 50% suggests the **combination of oil volatility regime, VIX, and demand/supply classification** contains meaningful directional signal at 22 days.
+
+---
+
+## 11. Out-of-Sample: 2026 Events
+
+![2026 predictions vs actuals](plots_event_study/predictions_2026.png)
+
+| Date | Oil return | Type | Predicted 22d | Actual 22d |
+|---|---|---|---|---|
+| Mar 13, 2026 | +2.7% | Demand shock | +0.1 to +0.5% | **+3.75%** |
+| Mar 31, 2026 | +4.9% | — | — | pending |
+
+Models correctly sign the 22d prediction for Mar 13 (positive), but severely underestimate the magnitude. The large 22d outperformance was driven by broader macro factors (tariff shock → policy pivot narrative) beyond what oil-shock features capture.
+
+---
+
+## 12. Limitations & Next Steps
+
+1. **Small sample.** 85 pre-2026 training events caps CV R² structurally. Ridge shrinks almost to the mean because genuine signal is weak relative to noise.
+
+2. **Causal identification.** The demand/supply classification uses contemporaneous S&P returns, which are partially caused by the oil shock itself. A cleaner approach uses lagged instruments (oil futures curve slope, OPEC announcements) or a monthly structural VAR (Kilian 2009).
+
+3. **Macro controls.** Adding recession indicator (NBER), Fed funds rate, and credit spreads (IG/HY) would improve 22d predictions — these determine whether an oil shock hits a fragile or resilient economy.
+
+4. **Time-varying dynamics.** Oil shock effects may have shifted as the U.S. became an oil exporter post-2015 shale. A rolling or Markov-switching model would capture structural breaks.
+
+5. **Sector-level prediction.** XLE shows much stronger average reactions than S&P and deserves a dedicated cross-sectional model with sector-specific features (oil beta, trailing sector momentum).
