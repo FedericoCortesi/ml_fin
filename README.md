@@ -8,9 +8,15 @@
 
 This memo documents the empirical approach taken to answer the core project question:
 
-> *How do equity markets react to oil price shocks, and can we predict that reaction?*
+> Model market reaction to oil price shocks. Use events prior to 2026 for training and testing, then compare the model’s predictions for this year’s events with the actual behavior of the markets affected.
 
 The analysis runs from December 1998 (XLE inception) through April 16, 2026, using daily Brent crude, S&P 500, and all 11 SPDR sector ETFs. All code is in `analysis.py`; all plots are in `plots_event_study/`.
+
+---
+
+## 0. Full-History Overview
+
+![Cumulative returns with shock events](plots_event_study/cumulative_returns_with_events.png)
 
 ---
 
@@ -37,6 +43,8 @@ Consecutive shock days within a 10-trading-day window are collapsed into one eve
 ## 2. Demand vs. Supply Shock Classification
 
 Following Kilian & Park (2009), we classify each shock using the **contemporaneous S&P 500 return** on the shock day:
+
+> **check citation**
 
 ```
 shock_concordance = sign(ret_oil) × sign(ret_S&P)
@@ -241,6 +249,8 @@ Despite the caveats, 61% directional accuracy well above 50% suggests the **comb
 ---
 
 ## 11. Out-of-Sample: 2026 Events
+
+![2026 market and predictions](plots_event_study/market_2026_with_predictions.png)
 
 ![2026 predictions vs actuals](plots_event_study/predictions_2026.png)
 

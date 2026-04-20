@@ -39,6 +39,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score, mean_absolute_error
 from sklearn.model_selection import cross_val_score, LeaveOneOut, GridSearchCV
 from scipy import stats
+import matplotlib.dates as mdates
+import matplotlib.patches as mpatches
 
 try:
     from statsmodels.regression.quantile_regression import QuantReg
@@ -54,7 +56,7 @@ plt.rcParams["figure.dpi"] = 120
 # ── Parameters ────────────────────────────────────────────────────────────────
 
 ROLL_WINDOW   = 756
-MIN_GAP_DAYS  = 10
+MIN_GAP_DAYS  = 22   # no two events within 22 days — prevents overlapping event windows
 EST_START     = -270
 EST_END       = -30
 EVENT_PRE     = 5
@@ -179,13 +181,15 @@ candidates = df.index[df["shock_raw"]].tolist()
 def extremeness(i):
     return df.loc[i, "price"] if df.loc[i, "is_3y_high"] else -df.loc[i, "price"]
 
-candidates_sorted = sorted(candidates, key=lambda i: -extremeness(i))
+# Process chronologically; once an event is accepted, suppress the next
+# MIN_GAP_DAYS days forward (prevents overlapping event windows).
+candidates_sorted = sorted(candidates)   # chronological order
 accepted, suppressed = [], set()
 for idx in candidates_sorted:
     if idx in suppressed:
         continue
     accepted.append(idx)
-    for d in range(-MIN_GAP_DAYS, MIN_GAP_DAYS + 1):
+    for d in range(1, MIN_GAP_DAYS + 1):   # forward-only suppression
         suppressed.add(idx + d)
 
 df["shock"] = False
@@ -611,8 +615,8 @@ for col_i, h in enumerate(CAR_HORIZONS):
         _, p_pos = stats.ttest_1samp(dpos, 0)
         _, p_neg = stats.ttest_1samp(dneg, 0)
         ax.set_title(f"{'S&P' if asset=='sp' else 'XLE'} CAR({h}d)\n"
-                     f"+ mean={dpos.mean():.2f}% p={p_pos:.2f}  "
-                     f"− mean={dneg.mean():.2f}% p={p_neg:.2f}")
+                     rf"$+\mu$={dpos.mean():.2f}% p={p_pos:.2f}  "
+                     rf"$-\mu$={dneg.mean():.2f}% p={p_neg:.2f}")
         ax.set_xlabel("CAR (%)")
         ax.legend(fontsize=8)
 plt.suptitle("Distribution of Cumulative Abnormal Returns by shock type (pre-2026)")
@@ -935,5 +939,148 @@ ax.set_xlabel("Event number")
 ax.set_ylabel("Return (%)")
 plt.suptitle("LOO Backtest: Directional Signal → Long/Short S&P on Shock Days", fontsize=12)
 save("loo_strategy_pnl.png")
+
+# ── 7n. Full history: cumulative returns + shock events ───────────────────────
+
+xle_start_loc = df.loc[df["ret_xle"].notna()].index[0]
+sub_hist = df.loc[xle_start_loc:].copy().reset_index(drop=True)
+cum_sp_h  = (1 + sub_hist["ret_gspc"]).cumprod() * 100
+cum_xle_h = (1 + sub_hist["ret_xle"].fillna(0)).cumprod() * 100
+oil_idx_h = sub_hist["price"] / sub_hist["price"].iloc[0] * 100
+dates_h   = pd.to_datetime(sub_hist["date"])
+
+fig, axes_ = plt.subplots(3, 1, figsize=(20, 12), sharex=True)
+for ax, series, label, color in [
+    (axes_[0], cum_sp_h,  "S&P 500 (rebased 100)",    "navy"),
+    (axes_[1], cum_xle_h, "XLE  (rebased 100)",        "darkorange"),
+    (axes_[2], oil_idx_h, "Brent crude (rebased 100)", "sienna"),
+]:
+    ax.plot(dates_h, series.values, linewidth=1, color=color)
+    ax.axhline(100, color="black", linewidth=0.4, linestyle=":")
+    ax.set_ylabel(label, fontsize=10)
+    ax.set_yscale("log")
+
+# Vertical lines for each shock event
+for _, ev in events.iterrows():
+    d = pd.Timestamp(ev["date"])
+    c = "darkorange" if ev["shock_dir"] == 1 else "steelblue"
+    for ax in axes_:
+        ax.axvline(d, color=c, linewidth=0.7, alpha=0.5, linestyle="--")
+
+n_pos = int((events["shock_dir"] == 1).sum())
+n_neg = int((events["shock_dir"] ==-1).sum())
+pos_p = mpatches.Patch(color="darkorange", alpha=0.7, label=f"Positive shock (n={n_pos})")
+neg_p = mpatches.Patch(color="steelblue",  alpha=0.7, label=f"Negative shock (n={n_neg})")
+axes_[0].legend(handles=[pos_p, neg_p], fontsize=9, loc="upper left")
+
+axes_[-1].xaxis.set_major_locator(mdates.YearLocator(2))
+axes_[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+fig.autofmt_xdate()
+plt.suptitle(f"Cumulative Returns of S&P 500, XLE, and Brent Crude\n"
+             f"Oil Price Shock Events marked  (n={len(events)} events, log scale)",
+             fontsize=13)
+save("cumulative_returns_with_events.png")
+
+# ── 7o. 2026 zoom: market prices + model prediction lines ─────────────────────
+
+df_2026     = df[df["date"].dt.year >= 2026].copy().reset_index(drop=True)
+events_2026 = events[events["date"].dt.year >= 2026].copy()
+
+if len(df_2026) > 0 and len(events_2026) > 0:
+    oil_2026     = df_2026["price"] / df_2026["price"].iloc[0] * 100
+    sp_2026_cum  = (1 + df_2026["ret_gspc"].fillna(0)).cumprod() * 100
+    xle_2026_cum = (1 + df_2026["ret_xle"].fillna(0)).cumprod() * 100
+    dates_2026   = pd.to_datetime(df_2026["date"])
+
+    fig, axes_ = plt.subplots(3, 1, figsize=(14, 13),
+                              gridspec_kw={"height_ratios": [1, 1, 1.4]})
+
+    # Panel 1: Oil
+    axes_[0].plot(dates_2026, oil_2026, color="sienna", linewidth=1.5)
+    axes_[0].axhline(100, color="black", linewidth=0.4, linestyle=":")
+    axes_[0].set_ylabel("Brent crude (rebased 100)")
+
+    # Panel 2: S&P500 and XLE
+    axes_[1].plot(dates_2026, sp_2026_cum,  color="navy",       linewidth=1.5, label="S&P 500")
+    axes_[1].plot(dates_2026, xle_2026_cum, color="darkorange",  linewidth=1.5, label="XLE")
+    axes_[1].axhline(100, color="black", linewidth=0.4, linestyle=":")
+    axes_[1].set_ylabel("Price index (rebased 100)")
+    axes_[1].legend(fontsize=9, loc="lower left")
+
+    # Mark shock events on top two panels
+    for _, ev in events_2026.iterrows():
+        d   = pd.Timestamp(ev["date"])
+        c   = "darkorange" if ev["shock_dir"] == 1 else "steelblue"
+        lbl = ev["date"].strftime("%b %d")
+        for ax in axes_[:2]:
+            ax.axvline(d, color=c, linewidth=2, linestyle="--", alpha=0.85)
+            ax.annotate(lbl, xy=(d, 1), xycoords=("data", "axes fraction"),
+                        xytext=(4, -4), textcoords="offset points",
+                        fontsize=8, color=c, rotation=90, va="top")
+
+    axes_[0].xaxis.set_major_locator(mdates.WeekdayLocator(interval=2))
+    axes_[0].xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+    axes_[1].xaxis.set_major_locator(mdates.WeekdayLocator(interval=2))
+    axes_[1].xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+    for ax in axes_[:2]:
+        ax.tick_params(axis="x", rotation=30)
+
+    # Panel 3: actual CAR path + model prediction lines per event
+    ax_car = axes_[2]
+    ax_car.axhline(0, color="black", linewidth=0.9)
+    ax_car.axvline(0, color="black", linewidth=1.2, linestyle="--", alpha=0.5)
+    ax_car.set_xlabel("Days relative to shock day")
+    ax_car.set_ylabel("S&P Cumulative Abnormal Return (%)")
+
+    x_full    = np.arange(-EVENT_PRE, EVENT_POST + 1)
+    ev_colors = ["#1f77b4", "#ff7f0e", "#2ca02c"]
+    model_styles = [
+        ("OLS",   "forestgreen", "--",  "o"),
+        ("Ridge", "crimson",     "-.",  "s"),
+        ("Lasso", "purple",      ":",   "^"),
+    ]
+
+    for i, (_, ev) in enumerate(events_2026.iterrows()):
+        ec      = ev_colors[i % len(ev_colors)]
+        ev_lbl  = ev["date"].strftime("%b %d")
+
+        # Actual CAR path
+        ar = ev.get("_ar_sp")
+        if ar is not None:
+            try:
+                ar_arr   = np.asarray(ar, dtype=float)
+                car_path = np.cumsum(ar_arr)
+                if t0 > 0:
+                    car_path = car_path - car_path[t0 - 1]
+                ax_car.plot(x_full, car_path * 100, color=ec, linewidth=2.5,
+                            label=f"Actual  {ev_lbl}", zorder=5)
+            except Exception:
+                pass
+
+        # Model predictions (piecewise lines at 0 → 1d → 5d → 22d)
+        test_row = test[test["date"] == ev["date"]]
+        if len(test_row) == 0:
+            continue
+        tr = test_row.iloc[0]
+        for name, mc, ms, mk in model_styles:
+            pred_x = [0] + list(CAR_HORIZONS)
+            pred_y = [0.0]
+            for h in CAR_HORIZONS:
+                col = f"car_sp_{h}_pred_{name}"
+                v   = tr[col] if col in tr.index else np.nan
+                pred_y.append(float(v) * 100 if pd.notna(v) else np.nan)
+            valid = [(px, py) for px, py in zip(pred_x, pred_y) if not np.isnan(py)]
+            if len(valid) > 1:
+                pxv, pyv = zip(*valid)
+                ax_car.plot(pxv, pyv, color=mc, linewidth=1.6, linestyle=ms,
+                            marker=mk, markersize=7, alpha=0.85,
+                            label=f"{name}  {ev_lbl}")
+
+    ax_car.legend(fontsize=8, ncol=2, loc="upper left")
+    ax_car.set_xlim(-EVENT_PRE - 0.5, EVENT_POST + 0.5)
+    ax_car.set_title("S&P 500 CAR path: actual (solid) vs model predictions (dashed)")
+
+    plt.suptitle("2026: Oil Shocks — Market Evolution and Model Predictions", fontsize=13)
+    save("market_2026_with_predictions.png")
 
 print(f"\nAll plots saved to ./{OUTDIR}/")
