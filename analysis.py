@@ -38,6 +38,7 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score, mean_absolute_error
 from sklearn.model_selection import cross_val_score, LeaveOneOut, GridSearchCV
+from sklearn.dummy import DummyRegressor
 from scipy import stats
 import matplotlib.dates as mdates
 import matplotlib.patches as mpatches
@@ -148,6 +149,31 @@ except Exception:
     vix_df = pd.DataFrame(columns=["date", "vix_close"])
     print("  VIX download failed — vix_pre feature will be NaN")
 
+# Macro controls
+def download_level(ticker, col_name):
+    try:
+        raw = yf.download(ticker, start="1988-01-01", end="2026-04-17", progress=False)
+        if raw.empty:
+            return pd.DataFrame(columns=["date", col_name])
+        if raw.columns.nlevels > 1:
+            raw.columns = raw.columns.get_level_values(0)
+        raw = raw.reset_index()
+        raw.columns = [c.lower() for c in raw.columns]
+        raw["date"] = pd.to_datetime(raw["date"])
+        return raw[["date", "close"]].rename(columns={"close": col_name}).dropna()
+    except Exception:
+        return pd.DataFrame(columns=["date", col_name])
+
+lqd_df = download_level("LQD",      "lqd_close")   # IG credit proxy (inception Jul 2002)
+dxy_df = download_level("DX-Y.NYB", "dxy_close")   # US Dollar Index
+tnx_df = download_level("^TNX",     "tnx_close")   # 10yr Treasury yield
+irx_df = download_level("^IRX",     "irx_close")   # 13wk T-bill yield
+for label, mdf in [("LQD", lqd_df), ("DXY", dxy_df), ("TNX", tnx_df), ("IRX", irx_df)]:
+    if len(mdf) > 0:
+        print(f"  {label} downloaded  ({len(mdf)} rows  from {mdf['date'].min().date()})")
+    else:
+        print(f"  {label} download failed")
+
 # ── 3. Merge ──────────────────────────────────────────────────────────────────
 
 df = oil[["date", "price", "ret_oil", "sigma_252", "oil_trend_60"]].merge(
@@ -155,7 +181,17 @@ df = oil[["date", "price", "ret_oil", "sigma_252", "oil_trend_60"]].merge(
 for code, sdf in sector_data.items():
     df = df.merge(sdf[["date", f"ret_{code}"]], on="date", how="left")
 df = df.merge(vix_df, on="date", how="left")
+for mdf in [lqd_df, dxy_df, tnx_df, irx_df]:
+    if len(mdf) > 0:
+        df = df.merge(mdf, on="date", how="left")
 df = df.sort_values("date").reset_index(drop=True)
+# Derived macro columns
+if "lqd_close" in df.columns:
+    df["ret_lqd"] = df["lqd_close"].pct_change()
+if "dxy_close" in df.columns:
+    df["ret_dxy"] = df["dxy_close"].pct_change()
+if "tnx_close" in df.columns and "irx_close" in df.columns:
+    df["term_spread"] = df["tnx_close"] - df["irx_close"]
 
 print(f"\nMerged: {len(df):,} rows  {df['date'].min().date()} → {df['date'].max().date()}")
 print("Sector coverage:")
@@ -251,6 +287,14 @@ for loc in shock_locs:
     raw_type    = np.sign(ret_oil_t0) * np.sign(ret_gspc_t0)
     shock_type  = int(raw_type) if raw_type != 0 else 1
 
+    # Lagged (pre-determined) demand/supply proxy — fully known before the shock.
+    # Uses sign(oil_trend_60) × sign(sp_pre_22): both are pre-shock quantities,
+    # so this version is not endogenous to the shock itself.
+    oil_t60    = float(df.iloc[loc]["oil_trend_60"])
+    sp_p22     = float(df.iloc[loc - 22 : loc]["ret_gspc"].sum())
+    raw_lag    = np.sign(oil_t60) * np.sign(sp_p22)
+    shock_type_lag = int(raw_lag) if raw_lag != 0 else 1
+
     # VIX level in 5 days before shock
     vix_slice = df.iloc[max(0, loc - 5) : loc]["vix_close"]
     vix_pre   = float(vix_slice.mean()) if (
@@ -266,7 +310,8 @@ for loc in shock_locs:
         "sigma_252":     df.iloc[loc]["sigma_252"],
         "dist_from_max": df.iloc[loc]["dist_from_max"],
         "oil_trend_60":  df.iloc[loc]["oil_trend_60"],
-        "shock_type":    shock_type,
+        "shock_type":     shock_type,
+        "shock_type_lag": shock_type_lag,
         "vix_pre":       vix_pre,
         "sp_pre_22":     df.iloc[loc - 22 : loc]["ret_gspc"].sum(),
         "sp_pre_5":      df.iloc[loc -  5 : loc]["ret_gspc"].sum(),
@@ -289,6 +334,19 @@ for loc in shock_locs:
         else:
             for h in CAR_HORIZONS:
                 row[f"car_{sec}_{h}"] = np.nan
+
+    # Macro control features (NaN when series not yet available)
+    def _pre5(col):
+        if col in df.columns:
+            return float(df.iloc[max(0, loc-5):loc][col].sum(min_count=1))
+        return np.nan
+
+    row["lqd_pre5"]   = _pre5("ret_lqd")
+    row["dxy_pre5"]   = _pre5("ret_dxy")
+    row["term_spread"] = (float(df.iloc[loc - 1]["term_spread"])
+                          if "term_spread" in df.columns else np.nan)
+    row["vix_chg5"]   = (float(df.iloc[loc - 1]["vix_close"] - df.iloc[max(0, loc - 6)]["vix_close"])
+                          if "vix_close" in df.columns else np.nan)
 
     records.append(row)
 
@@ -355,7 +413,13 @@ for name, make in MODEL_SPECS.items():
         test[f"car_sp_{h}_pred_{name}"] = y_pred_test
 
 print("\n=== Cross-sectional model: CAR_SP ~ shock features (original 5) ===")
+print(f"  (Null baseline = predict training mean; CV R²=0 by definition)")
 print(f"{'Model':6s}  {'H':>3s}  {'cv_R²':>7s}  {'train_R²':>8s}  {'test_MAE':>10s}")
+# Null baseline: DummyRegressor(predict mean) — CV R² should be ≈ 0
+for h in CAR_HORIZONS:
+    null_cv = cross_val_score(DummyRegressor(strategy="mean"),
+                              Xs_train, train[f"car_sp_{h}"].values, cv=5, scoring="r2").mean()
+    print(f"{'Null':6s}  {h:3d}  {null_cv:7.3f}  {'0.000':>8s}  {'n/a':>10s}")
 for r in results:
     mae_s = f"{r['test_mae']:.4f}" if pd.notna(r["test_mae"]) else "    n/a"
     print(f"{r['model']:6s}  {r['horizon']:3d}  {r['cv_r2']:7.3f}  {r['train_r2']:8.3f}  {mae_s:>10s}")
@@ -365,7 +429,7 @@ for r in results:
 FEATURES_EXT = [
     "shock_dir", "ret_oil", "ret_oil_abs", "sigma_252",
     "sp_pre_22", "sp_pre_5", "dist_from_max",
-    "oil_trend_60", "shock_type", "vix_pre",
+    "oil_trend_60", "shock_type", "shock_type_lag", "vix_pre",
 ]
 
 train_ext = train.dropna(
@@ -420,11 +484,31 @@ for name, make in EXT_MODEL_SPECS.items():
             "train_r2": r2_score(y_train, y_pred_train), "test_mae": test_mae,
         })
 
-print("\n=== Extended model: CAR_SP ~ 10 features (includes RF + GBM) ===")
+print("\n=== Extended model: CAR_SP ~ 11 features (includes RF + GBM) ===")
 print(f"{'Model':12s}  {'H':>3s}  {'cv_R²':>7s}  {'train_R²':>8s}  {'test_MAE':>10s}")
 for r in results_ext:
     mae_s = f"{r['test_mae']:.4f}" if pd.notna(r["test_mae"]) else "    n/a"
     print(f"{r['model']:12s}  {r['horizon']:3d}  {r['cv_r2']:7.3f}  {r['train_r2']:8.3f}  {mae_s:>10s}")
+
+# ── shock_type endogeneity robustness ─────────────────────────────────────────
+# Compare shock_type (contemporaneous, endogenous) vs shock_type_lag
+# (pre-determined). Agreement rate and coefficient similarity validate that
+# shock_type is not spuriously picking up the shock's own effect.
+
+agree   = (train["shock_type"] == train["shock_type_lag"]).mean()
+print(f"\nshock_type vs shock_type_lag agreement rate: {agree:.1%}  (n={len(train)})")
+
+# Coefficients from Ridge_ext at each horizon
+st_idx  = FEATURES_EXT.index("shock_type")
+stl_idx = FEATURES_EXT.index("shock_type_lag")
+print(f"{'Horizon':>8s}  {'shock_type (Ridge)':>20s}  {'shock_type_lag (Ridge)':>23s}")
+for r in results_ext:
+    if r["model"] != "Ridge_ext":
+        continue
+    m  = models_ext["Ridge_ext"][r["horizon"]]
+    # RidgeCV stores coef_ directly
+    coef = m.coef_ if hasattr(m, "coef_") else np.zeros(len(FEATURES_EXT))
+    print(f"{r['horizon']:>8d}  {coef[st_idx]:>20.4f}  {coef[stl_idx]:>23.4f}")
 
 # ── 6c. PCA on sector CARs ────────────────────────────────────────────────────
 
@@ -539,6 +623,354 @@ print(f"  Strategy total CAR    : {loo_strategy_ret.sum()*100:.1f}%")
 print(f"  Benchmark total CAR   : {loo_benchmark.sum()*100:.1f}%  (always long)")
 print(f"  Strategy Sharpe (ann) : {loo_strategy_ret.mean()/(loo_strategy_ret.std()+1e-10)*ann:.2f}")
 print(f"  Benchmark Sharpe (ann): {loo_benchmark.mean()   /(loo_benchmark.std()   +1e-10)*ann:.2f}")
+
+# ── 6g. XLE cross-sectional models ───────────────────────────────────────────
+# Mirrors sections 6 / 6b / 6f but targets CAR_XLE instead of CAR_SP.
+# Reuses the same scaled feature matrices (Xs_train / Xs_train_ext) since the
+# train rows are identical — XLE data covers the full event history.
+
+train_xle = train.dropna(subset=[f"car_xle_{h}" for h in CAR_HORIZONS]).copy()
+test_xle  = test.dropna(subset=[f"car_xle_{h}" for h in CAR_HORIZONS] if
+                         any(f"car_xle_{h}" in test.columns for h in CAR_HORIZONS)
+                         else []).copy()
+
+# Align index positions with Xs_train so we can reuse the scaled matrix
+xle_train_mask = train.index.isin(train_xle.index)
+Xs_train_xle   = Xs_train[xle_train_mask]
+Xs_test_xle    = Xs_test if len(test_xle) > 0 else np.empty((0, len(FEATURES)))
+
+models_xle  = {name: {} for name in MODEL_SPECS}
+results_xle = []
+
+for name, make in MODEL_SPECS.items():
+    for h in CAR_HORIZONS:
+        target  = f"car_xle_{h}"
+        y_train = train_xle[target].values
+        m = make().fit(Xs_train_xle, y_train)
+        models_xle[name][h] = m
+        y_pred_train = m.predict(Xs_train_xle)
+        cv_r2 = cross_val_score(m, Xs_train_xle, y_train, cv=5, scoring="r2").mean()
+        if len(test_xle) > 0:
+            y_pred_test = m.predict(Xs_test_xle)
+            y_actual    = test_xle[target].values
+            mask        = ~np.isnan(y_actual)
+            test_mae    = mean_absolute_error(y_actual[mask], y_pred_test[mask]) if mask.any() else np.nan
+            test_xle[f"{target}_pred_{name}"] = y_pred_test
+        else:
+            test_mae = np.nan
+        coef = m.coef_ if hasattr(m, "coef_") else np.full(len(FEATURES), np.nan)
+        results_xle.append({
+            "model": name, "horizon": h, "cv_r2": cv_r2,
+            "train_r2": r2_score(y_train, y_pred_train),
+            "test_mae": test_mae, "coefs": dict(zip(FEATURES, coef)),
+        })
+
+print("\n=== XLE model: CAR_XLE ~ shock features (original 5) ===")
+print(f"{'Model':6s}  {'H':>3s}  {'cv_R²':>7s}  {'train_R²':>8s}  {'test_MAE':>10s}")
+for h in CAR_HORIZONS:
+    null_cv_xle = cross_val_score(DummyRegressor(strategy="mean"),
+                                  Xs_train_xle, train_xle[f"car_xle_{h}"].values,
+                                  cv=5, scoring="r2").mean()
+    print(f"{'Null':6s}  {h:3d}  {null_cv_xle:7.3f}  {'0.000':>8s}  {'n/a':>10s}")
+for r in results_xle:
+    mae_s = f"{r['test_mae']:.4f}" if pd.notna(r["test_mae"]) else "    n/a"
+    print(f"{r['model']:6s}  {r['horizon']:3d}  {r['cv_r2']:7.3f}  {r['train_r2']:8.3f}  {mae_s:>10s}")
+
+# Extended features + RF + GBM for XLE
+train_xle_ext = train_ext.dropna(subset=[f"car_xle_{h}" for h in CAR_HORIZONS]).copy()
+test_xle_ext  = test_ext.dropna(subset=[f"car_xle_{h}" for h in CAR_HORIZONS] if
+                                  any(f"car_xle_{h}" in test_ext.columns for h in CAR_HORIZONS)
+                                  else []).copy()
+
+xle_ext_train_mask = train_ext.index.isin(train_xle_ext.index)
+Xs_train_xle_ext   = Xs_train_ext[xle_ext_train_mask]
+Xs_test_xle_ext    = Xs_test_ext if len(test_xle_ext) > 0 else np.empty((0, len(FEATURES_EXT)))
+
+models_xle_ext  = {name: {} for name in EXT_MODEL_SPECS}
+results_xle_ext = []
+
+for name, make in EXT_MODEL_SPECS.items():
+    for h in CAR_HORIZONS:
+        target  = f"car_xle_{h}"
+        y_train = train_xle_ext[target].values
+        m = make().fit(Xs_train_xle_ext, y_train)
+        models_xle_ext[name][h] = m
+        y_pred_train = m.predict(Xs_train_xle_ext)
+        cv_r2 = m.best_score_ if hasattr(m, "best_score_") else cross_val_score(
+            m, Xs_train_xle_ext, y_train, cv=5, scoring="r2").mean()
+        if len(test_xle_ext) > 0:
+            y_pred_test = m.predict(Xs_test_xle_ext)
+            y_actual    = test_xle_ext[target].values
+            mask        = ~np.isnan(y_actual)
+            test_mae    = mean_absolute_error(y_actual[mask], y_pred_test[mask]) if mask.any() else np.nan
+            test_xle_ext[f"{target}_pred_{name}"] = y_pred_test
+        else:
+            test_mae = np.nan
+        results_xle_ext.append({
+            "model": name, "horizon": h, "cv_r2": cv_r2,
+            "train_r2": r2_score(y_train, y_pred_train), "test_mae": test_mae,
+        })
+
+print("\n=== XLE extended model: CAR_XLE ~ 11 features (RF + GBM) ===")
+print(f"{'Model':12s}  {'H':>3s}  {'cv_R²':>7s}  {'train_R²':>8s}  {'test_MAE':>10s}")
+for r in results_xle_ext:
+    mae_s = f"{r['test_mae']:.4f}" if pd.notna(r["test_mae"]) else "    n/a"
+    print(f"{r['model']:12s}  {r['horizon']:3d}  {r['cv_r2']:7.3f}  {r['train_r2']:8.3f}  {mae_s:>10s}")
+
+# LOO backtest for XLE
+y_loo_xle      = train_xle_ext[f"car_xle_{h_loo}"].values
+best_alpha_xle = models_xle_ext["Ridge_ext"][h_loo].alpha_ if hasattr(
+    models_xle_ext["Ridge_ext"][h_loo], "alpha_") else 1.0
+
+loo_preds_xle = np.zeros(len(train_xle_ext))
+for tr_idx, te_idx in LeaveOneOut().split(Xs_train_xle_ext):
+    m_loo_xle = Ridge(alpha=best_alpha_xle).fit(
+        Xs_train_xle_ext[tr_idx], y_loo_xle[tr_idx])
+    loo_preds_xle[te_idx] = m_loo_xle.predict(Xs_train_xle_ext[te_idx])
+
+loo_dir_acc_xle      = (np.sign(loo_preds_xle) == np.sign(y_loo_xle)).mean()
+loo_strategy_ret_xle = np.sign(loo_preds_xle) * y_loo_xle
+loo_benchmark_xle    = y_loo_xle
+
+print(f"\nLOO Backtest  (Ridge, XLE CAR {h_loo}d, extended features):")
+print(f"  Directional accuracy  : {loo_dir_acc_xle:.1%}")
+print(f"  Strategy total CAR    : {loo_strategy_ret_xle.sum()*100:.1f}%")
+print(f"  Benchmark total CAR   : {loo_benchmark_xle.sum()*100:.1f}%  (always long XLE)")
+print(f"  Strategy Sharpe (ann) : {loo_strategy_ret_xle.mean()/(loo_strategy_ret_xle.std()+1e-10)*ann:.2f}")
+print(f"  Benchmark Sharpe (ann): {loo_benchmark_xle.mean()   /(loo_benchmark_xle.std()   +1e-10)*ann:.2f}")
+
+if len(test_xle) > 0:
+    print("\n=== 2026 Events: Predicted vs Actual XLE CAR ===")
+    out_xle = test_xle[["date", "ret_oil", "shock_dir"]].copy()
+    out_xle["type"] = out_xle["shock_dir"].map({1: "3y-high", -1: "3y-low"})
+    for h in CAR_HORIZONS:
+        out_xle[f"actual_{h}d"] = (test_xle[f"car_xle_{h}"] * 100).round(2)
+        for name in MODEL_SPECS:
+            col = f"car_xle_{h}_pred_{name}"
+            out_xle[f"{name}_{h}d"] = (test_xle[col] * 100).round(2) if col in test_xle.columns else np.nan
+    out_xle = out_xle.drop(columns=["shock_dir"])
+    print(out_xle.to_string(index=False))
+
+# ── 6h. Macro-augmented models ────────────────────────────────────────────────
+# Adds 4 pre-shock macro controls on top of FEATURES_EXT.
+# Run Ridge + Lasso only (honest estimators); compare CV R² to baseline.
+
+MACRO_CONTROLS  = ["dxy_pre5", "term_spread", "vix_chg5"]  # LQD excluded (starts 2002)
+FEATURES_MACRO  = FEATURES_EXT + MACRO_CONTROLS
+
+# Events with all macro features available (LQD starts Jul 2002, so some
+# early events will be dropped — report n clearly)
+train_macro = train.dropna(
+    subset=FEATURES_MACRO + [f"car_sp_{h}" for h in CAR_HORIZONS]).copy()
+test_macro  = test.dropna(subset=FEATURES_MACRO).copy()
+
+scaler_macro   = StandardScaler().fit(train_macro[FEATURES_MACRO].values)
+Xs_train_macro = scaler_macro.transform(train_macro[FEATURES_MACRO].values)
+Xs_test_macro  = (scaler_macro.transform(test_macro[FEATURES_MACRO].values)
+                  if len(test_macro) > 0 else np.empty((0, len(FEATURES_MACRO))))
+
+print(f"\n=== Macro-augmented models  (n_train={len(train_macro)}, dropped {len(train)-len(train_macro)} events with missing macro data) ===")
+print(f"Features: {FEATURES_MACRO}")
+
+MACRO_MODEL_SPECS = {
+    "Ridge_macro": lambda: RidgeCV(alphas=alphas, cv=5),
+    "Lasso_macro": lambda: LassoCV(alphas=alphas, cv=5, max_iter=10_000),
+}
+
+results_macro    = []   # S&P target
+results_macro_xle = []  # XLE target
+
+train_macro_xle = train_macro.dropna(
+    subset=[f"car_xle_{h}" for h in CAR_HORIZONS]).copy()
+xle_macro_mask  = train_macro.index.isin(train_macro_xle.index)
+Xs_train_macro_xle = Xs_train_macro[xle_macro_mask]
+
+for name, make in MACRO_MODEL_SPECS.items():
+    for asset, results_list, train_df, Xs in [
+        ("sp",  results_macro,     train_macro,     Xs_train_macro),
+        ("xle", results_macro_xle, train_macro_xle, Xs_train_macro_xle),
+    ]:
+        for h in CAR_HORIZONS:
+            target  = f"car_{asset}_{h}"
+            y_train = train_df[target].values
+            m       = make().fit(Xs, y_train)
+            cv_r2   = cross_val_score(m, Xs, y_train, cv=5, scoring="r2").mean()
+            coef    = dict(zip(FEATURES_MACRO, m.coef_))
+            results_list.append({
+                "model": name, "asset": asset, "horizon": h,
+                "cv_r2": cv_r2, "train_r2": r2_score(y_train, m.predict(Xs)),
+                "coefs": coef,
+            })
+
+# Print comparison table: baseline Ridge_ext vs Ridge_macro
+print(f"\n{'Asset':4s}  {'H':>3s}  {'Ridge_ext (10f)':>16s}  {'Ridge_macro (14f)':>18s}  {'Lasso_macro (14f)':>18s}")
+baseline_ext = {(r["model"], r["horizon"]): r["cv_r2"]
+                for r in results_ext + results_xle_ext
+                if r["model"] == "Ridge_ext"}
+
+for asset, res_list, ext_list in [
+    ("sp",  results_macro,     results_ext),
+    ("xle", results_macro_xle, results_xle_ext),
+]:
+    for h in CAR_HORIZONS:
+        ext_cv  = next((r["cv_r2"] for r in ext_list
+                        if r["model"] == "Ridge_ext" and r["horizon"] == h), np.nan)
+        ridge_m = next((r["cv_r2"] for r in res_list
+                        if r["model"] == "Ridge_macro" and r["horizon"] == h), np.nan)
+        lasso_m = next((r["cv_r2"] for r in res_list
+                        if r["model"] == "Lasso_macro" and r["horizon"] == h), np.nan)
+        print(f"{asset:4s}  {h:3d}  {ext_cv:16.3f}  {ridge_m:18.3f}  {lasso_m:18.3f}")
+
+# Lasso non-zero features (variable selection result)
+print("\nLasso_macro non-zero coefficients (XLE 1d — where signal exists):")
+xle_1d_lasso = next((r for r in results_macro_xle
+                     if r["model"] == "Lasso_macro" and r["horizon"] == 1), None)
+if xle_1d_lasso:
+    nonzero = {k: v for k, v in xle_1d_lasso["coefs"].items() if abs(v) > 1e-6}
+    for k, v in sorted(nonzero.items(), key=lambda x: -abs(x[1])):
+        print(f"  {k:20s}  {v:+.4f}")
+
+print("\nLasso_macro non-zero coefficients (S&P 22d):")
+sp_22_lasso = next((r for r in results_macro
+                    if r["model"] == "Lasso_macro" and r["horizon"] == 22), None)
+if sp_22_lasso:
+    nonzero = {k: v for k, v in sp_22_lasso["coefs"].items() if abs(v) > 1e-6}
+    if nonzero:
+        for k, v in sorted(nonzero.items(), key=lambda x: -abs(x[1])):
+            print(f"  {k:20s}  {v:+.4f}")
+    else:
+        print("  (all zeroed out)")
+
+# ── 6i. Secondary shock definition: |ret_oil| > 3σ_252 ───────────────────────
+
+# Identify secondary shocks
+df["shock_3sig"] = df["ret_oil"].abs() > 3 * df["sigma_252"]
+cands_3sig = sorted(df.index[df["shock_3sig"] & df["sigma_252"].notna()].tolist())
+
+accepted_3sig, supp_3sig = [], set()
+for idx in cands_3sig:
+    if idx in supp_3sig:
+        continue
+    accepted_3sig.append(idx)
+    for d in range(1, MIN_GAP_DAYS + 1):
+        supp_3sig.add(idx + d)
+
+# Direction and dates
+df_3sig = pd.DataFrame({
+    "idx":       accepted_3sig,
+    "date":      df.loc[accepted_3sig, "date"].values,
+    "ret_oil":   df.loc[accepted_3sig, "ret_oil"].values,
+    "shock_dir": np.sign(df.loc[accepted_3sig, "ret_oil"].values).astype(int),
+})
+
+print(f"\n=== Secondary shock definition: |ret_oil| > 3σ_252 ===")
+print(f"  Total events    : {len(accepted_3sig)}")
+print(f"  Positive (oil↑) : {(df_3sig['shock_dir'] == 1).sum()}")
+print(f"  Negative (oil↓) : {(df_3sig['shock_dir']==-1).sum()}")
+print(f"  Pre-2026        : {(df_3sig['date'].dt.year < 2026).sum()}")
+
+# Overlap: a primary event overlaps with secondary if there is a secondary
+# event on the exact same day OR within ±5 days (same shock episode)
+primary_dates  = pd.to_datetime(events["date"].values)
+sec_dates      = pd.to_datetime(df_3sig["date"].values)
+
+def overlaps(d, date_set, window=5):
+    return any(abs((d - s).days) <= window for s in date_set)
+
+primary_in_sec = sum(overlaps(d, sec_dates) for d in primary_dates)
+sec_in_primary = sum(overlaps(d, primary_dates) for d in sec_dates)
+sec_only = len(sec_dates) - sec_in_primary
+
+print(f"\nOverlap (±5-day window):")
+print(f"  Primary events covered by secondary : {primary_in_sec}/{len(primary_dates)} ({primary_in_sec/len(primary_dates):.0%})")
+print(f"  Secondary events overlapping primary : {sec_in_primary}/{len(sec_dates)} ({sec_in_primary/len(sec_dates):.0%})")
+print(f"  Secondary-only events               : {sec_only}")
+
+# ── Event study on secondary events ──────────────────────────────────────────
+
+COMPARE_SECTORS = ["sp", "xle", "xly", "xlb", "xlu"]  # S&P + key sectors
+
+def run_event_study(shock_locs, label=""):
+    """Compact event study returning CAR DataFrame for COMPARE_SECTORS."""
+    recs = []
+    for loc in shock_locs:
+        est_s, est_e = loc + EST_START, loc + EST_END
+        ev_s,  ev_e  = loc - EVENT_PRE,  loc + EVENT_POST
+        if est_s < 0 or ev_e >= len(df):
+            continue
+        est = df.iloc[est_s:est_e]
+        ev  = df.iloc[ev_s:ev_e+1].copy()
+        if est["ret_gspc"].isna().any() or ev["ret_gspc"].isna().any():
+            continue
+        t0  = EVENT_PRE
+        mu_sp = est["ret_gspc"].mean()
+        ar_sp = ev["ret_gspc"].values - mu_sp
+        row = {
+            "date":      df.iloc[loc]["date"],
+            "ret_oil":   df.iloc[loc]["ret_oil"],
+            "sigma_252": df.iloc[loc]["sigma_252"],
+            "sp_pre_22": df.iloc[loc-22:loc]["ret_gspc"].sum(),
+            "dist_from_max": df.iloc[loc]["dist_from_max"],
+            "shock_dir": int(np.sign(df.iloc[loc]["ret_oil"])),
+            "_ar_sp":    ar_sp,
+        }
+        for h in CAR_HORIZONS:
+            row[f"car_sp_{h}"] = ar_sp[t0:t0+h+1].sum()
+        for sec in COMPARE_SECTORS[1:]:
+            col = f"ret_{sec}"
+            if col not in df.columns or est[col].isna().any() or ev[col].isna().any():
+                for h in CAR_HORIZONS:
+                    row[f"car_{sec}_{h}"] = np.nan
+                row[f"_ar_{sec}"] = None
+                continue
+            mm    = LinearRegression().fit(est["ret_gspc"].values.reshape(-1,1), est[col].values)
+            ar_s  = ev[col].values - mm.predict(ev["ret_gspc"].values.reshape(-1,1))
+            row[f"_ar_{sec}"] = ar_s
+            for h in CAR_HORIZONS:
+                row[f"car_{sec}_{h}"] = ar_s[t0:t0+h+1].sum()
+        recs.append(row)
+    return pd.DataFrame(recs)
+
+# Run secondary event study (pre-2026 only for comparison)
+sec_locs_pre26 = [i for i in accepted_3sig
+                  if df.loc[i, "date"].year < 2026]
+events_3sig = run_event_study(sec_locs_pre26, "3sig")
+
+print(f"\nSecondary events with sufficient data (pre-2026): {len(events_3sig)}")
+
+# Cross-sectional Ridge on secondary events (original 5 features, S&P + XLE)
+FEAT5 = ["shock_dir", "ret_oil", "sigma_252", "sp_pre_22", "dist_from_max"]
+print(f"\nRidge CV R² comparison — original 5 features:")
+print(f"{'Asset':4s}  {'H':>3s}  {'Primary def':>13s}  {'Secondary def':>14s}")
+for asset in ["sp", "xle"]:
+    for h in CAR_HORIZONS:
+        # primary
+        prim_r = next((r["cv_r2"] for r in results if r["model"]=="Ridge" and r["horizon"]==h), np.nan) \
+                 if asset=="sp" else \
+                 next((r["cv_r2"] for r in results_xle if r["model"]=="Ridge" and r["horizon"]==h), np.nan)
+        # secondary
+        tgt_col = f"car_{asset}_{h}"
+        sec_sub = events_3sig.dropna(subset=FEAT5+[tgt_col])
+        if len(sec_sub) >= 10:
+            Xs = StandardScaler().fit_transform(sec_sub[FEAT5].values)
+            m  = RidgeCV(alphas=alphas, cv=5).fit(Xs, sec_sub[tgt_col].values)
+            sec_r = cross_val_score(m, Xs, sec_sub[tgt_col].values, cv=5, scoring="r2").mean()
+        else:
+            sec_r = np.nan
+        print(f"{asset:4s}  {h:3d}  {prim_r:13.3f}  {sec_r:14.3f}")
+
+# Mean CAR comparison table
+print(f"\nMean CAR(22d) by sector and definition (pre-2026, positive shocks only):")
+print(f"{'Sector':12s}  {'Primary':>10s}  {'Secondary':>11s}")
+_train_rows_cmp = events[events["date"].dt.year < 2026]
+pos_prim = _train_rows_cmp[_train_rows_cmp["shock_dir"]==1]
+pos_sec  = events_3sig[events_3sig["shock_dir"]==1]
+for sec in COMPARE_SECTORS:
+    col = f"car_{sec}_22"
+    pv  = pos_prim[col].dropna().mean()*100 if col in pos_prim.columns else np.nan
+    sv  = pos_sec[col].dropna().mean()*100  if col in pos_sec.columns  else np.nan
+    lbl = SECTOR_LABELS.get(sec, sec.upper())
+    print(f"{lbl:12s}  {pv:10.2f}%  {sv:11.2f}%")
 
 # ── 7. Plots ──────────────────────────────────────────────────────────────────
 
@@ -940,7 +1372,274 @@ ax.set_ylabel("Return (%)")
 plt.suptitle("LOO Backtest: Directional Signal → Long/Short S&P on Shock Days", fontsize=12)
 save("loo_strategy_pnl.png")
 
-# ── 7n. Full history: cumulative returns + shock events ───────────────────────
+# ── 7n. XLE model comparison ─────────────────────────────────────────────────
+
+perf_xle_df = pd.DataFrame(results_xle)
+perf_ext_xle_df = pd.DataFrame(results_xle_ext)
+
+fig, axes_ = plt.subplots(1, 2, figsize=(16, 5))
+
+# Left: S&P vs XLE CV R² side-by-side for Ridge (the honest estimator)
+all_ridge = []
+for r in results:
+    if r["model"] == "Ridge":
+        all_ridge.append({"asset": "S&P", "horizon": r["horizon"], "cv_r2": r["cv_r2"]})
+for r in results_xle:
+    if r["model"] == "Ridge":
+        all_ridge.append({"asset": "XLE", "horizon": r["horizon"], "cv_r2": r["cv_r2"]})
+ridge_comp = pd.DataFrame(all_ridge).pivot(index="horizon", columns="asset", values="cv_r2")
+ridge_comp.plot(kind="bar", ax=axes_[0], rot=0, alpha=0.85,
+                color=["navy", "darkorange"])
+axes_[0].axhline(0, color="black", linewidth=0.9, linestyle="--")
+axes_[0].set_xlabel("Horizon (days)")
+axes_[0].set_ylabel("5-fold CV R²")
+axes_[0].set_title("Ridge CV R²: S&P vs XLE")
+axes_[0].legend(title="Asset")
+
+# Right: XLE extended model CV R²
+ext_xle_pivot = perf_ext_xle_df.pivot(index="horizon", columns="model", values="cv_r2")
+ext_sp_pivot  = pd.DataFrame(results_ext).pivot(index="horizon", columns="model", values="cv_r2")
+combined = ext_xle_pivot.rename(columns=lambda c: f"XLE {c}").join(
+           ext_sp_pivot.rename(columns=lambda c: f"S&P {c}"))
+combined[["S&P Ridge_ext", "XLE Ridge_ext"]].plot(
+    kind="bar", ax=axes_[1], rot=0, alpha=0.85, color=["navy", "darkorange"])
+axes_[1].axhline(0, color="black", linewidth=0.9, linestyle="--")
+axes_[1].set_xlabel("Horizon (days)")
+axes_[1].set_ylabel("5-fold CV R²")
+axes_[1].set_title("Ridge_ext CV R²: S&P vs XLE")
+axes_[1].legend(title="Asset")
+
+plt.suptitle("S&P vs XLE: Predictability of CAR from Oil Shock Features", fontsize=13)
+save("model_comparison_sp_vs_xle.png")
+
+# ── 7o. XLE 2026 predictions ──────────────────────────────────────────────────
+
+if len(test_xle) > 0:
+    n_events_xle = len(test_xle)
+    fig, axes_ = plt.subplots(len(CAR_HORIZONS), 1,
+                              figsize=(max(10, n_events_xle * 4), 5 * len(CAR_HORIZONS)))
+    for ax, h in zip(axes_, CAR_HORIZONS):
+        target  = f"car_xle_{h}"
+        actual  = test_xle[target].values * 100
+        dates   = test_xle["date"].values
+        dirs    = test_xle["shock_dir"].values
+        total_w = 0.75
+        bar_w   = total_w / (len(MODEL_SPECS) + 1)
+        offsets = np.linspace(-total_w/2, total_w/2, len(MODEL_SPECS) + 1)
+        x_pos   = np.arange(n_events_xle)
+        has_act = ~np.isnan(actual)
+        act_c   = ["darkorange" if d == 1 else "steelblue" for d in dirs]
+        if has_act.any():
+            ax.bar(x_pos[has_act] + offsets[0], actual[has_act], bar_w,
+                   color=[act_c[i] for i in np.where(has_act)[0]], alpha=0.85, label="Actual XLE CAR")
+        for i, name in enumerate(MODEL_SPECS):
+            col  = f"{target}_pred_{name}"
+            pred = test_xle[col].values * 100 if col in test_xle.columns else np.zeros(n_events_xle)
+            ax.bar(x_pos + offsets[i+1], pred, bar_w,
+                   color=MODEL_COLORS[name], alpha=0.75, label=name)
+        ax.axhline(0, color="black", linewidth=0.7)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(
+            [f"{pd.Timestamp(d).strftime('%b %d')} ({'↑' if di==1 else '↓'})"
+             for d, di in zip(dates, dirs)], rotation=20, ha="right")
+        ax.set_ylabel("CAR (%)")
+        ax.set_title(f"XLE CAR(0→{h}d) after 2026 oil shocks")
+        ax.legend(fontsize=9)
+    plt.suptitle("2026 Oil Shock Events: Predicted vs Actual XLE Abnormal Returns", fontsize=13)
+    save("predictions_2026_xle.png")
+
+# ── 7p. XLE feature importance ────────────────────────────────────────────────
+
+for name in ["RF", "GBM"]:
+    if name not in models_xle_ext:
+        continue
+    fig, axes_ = plt.subplots(1, len(CAR_HORIZONS),
+                              figsize=(5 * len(CAR_HORIZONS), 5))
+    for ax, h in zip(axes_, CAR_HORIZONS):
+        m_gs   = models_xle_ext[name][h]
+        best_m = m_gs.best_estimator_ if hasattr(m_gs, "best_estimator_") else m_gs
+        feat_s = pd.Series(best_m.feature_importances_, index=FEATURES_EXT).sort_values(ascending=True)
+        feat_s.plot(kind="barh", ax=ax, color="darkorange", alpha=0.8)
+        cv_str = f"{m_gs.best_score_:.3f}" if hasattr(m_gs, "best_score_") else "n/a"
+        ax.set_title(f"{name} XLE – {h}d  CV R²={cv_str}")
+        ax.set_xlabel("Feature importance")
+    plt.suptitle(f"{name} Feature Importances — XLE CAR prediction", fontsize=13)
+    save(f"feature_importance_{name.lower()}_xle.png")
+
+# ── 7q. XLE LOO strategy PnL ─────────────────────────────────────────────────
+
+fig, axes_ = plt.subplots(2, 1, figsize=(14, 8))
+
+ax = axes_[0]
+cum_strat_xle = np.cumsum(loo_strategy_ret_xle) * 100
+cum_bench_xle = np.cumsum(loo_benchmark_xle)    * 100
+ax.plot(cum_strat_xle, marker="o", markersize=3, color="crimson",
+        label=f"Ridge LOO strategy  (total {cum_strat_xle[-1]:.1f}%,  dir={loo_dir_acc_xle:.0%})")
+ax.plot(cum_bench_xle, marker="o", markersize=3, color="darkorange",
+        label=f"Always long XLE     (total {cum_bench_xle[-1]:.1f}%)")
+ax.axhline(0, color="black", linewidth=0.7)
+ax.set_title(f"XLE LOO Strategy: CAR {h_loo}d  (Ridge, extended features)")
+ax.set_xlabel("Event number (chronological)")
+ax.set_ylabel("Cumulative CAR (%)")
+ax.legend()
+
+ax = axes_[1]
+ax.bar(range(len(loo_strategy_ret_xle)),
+       loo_strategy_ret_xle * 100,
+       color=["forestgreen" if r >= 0 else "firebrick" for r in loo_strategy_ret_xle],
+       alpha=0.75)
+ax.axhline(0, color="black", linewidth=0.7)
+ax.set_title("Per-event XLE strategy returns")
+ax.set_xlabel("Event number")
+ax.set_ylabel("Return (%)")
+plt.suptitle("XLE LOO Backtest: Directional Signal → Long/Short XLE on Shock Days", fontsize=12)
+save("loo_strategy_pnl_xle.png")
+
+# ── 7r. Secondary shock definition: overlap + CAR comparison ─────────────────
+
+# ── 7r-i. Overlap bar chart ───────────────────────────────────────────────────
+fig, axes_ = plt.subplots(1, 2, figsize=(14, 5))
+
+ax = axes_[0]
+cats   = ["Primary\nonly", "Both\n(±5d)", "Secondary\nonly"]
+n_prim_only = len(primary_dates) - primary_in_sec
+counts = [n_prim_only, primary_in_sec, sec_only]
+colors = ["steelblue", "mediumpurple", "darkorange"]
+bars = ax.bar(cats, counts, color=colors, alpha=0.85, edgecolor="white")
+for bar, cnt in zip(bars, counts):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+            str(cnt), ha="center", va="bottom", fontsize=11)
+ax.set_ylabel("Number of events")
+ax.set_title("Event overlap between definitions\n(primary=3y extreme, secondary=|ret|>3σ)")
+
+ax = axes_[1]
+n_pos_sec = int((df_3sig["shock_dir"]==1).sum())
+n_neg_sec = int((df_3sig["shock_dir"]==-1).sum())
+n_pos_pri = int((events["shock_dir"]==1).sum())
+n_neg_pri = int((events["shock_dir"]==-1).sum())
+x = np.arange(2)
+w = 0.35
+ax.bar(x - w/2, [n_pos_pri, n_neg_pri], w, label="Primary",   color="steelblue",  alpha=0.85)
+ax.bar(x + w/2, [n_pos_sec, n_neg_sec], w, label="Secondary", color="darkorange", alpha=0.85)
+ax.set_xticks(x)
+ax.set_xticklabels(["Positive (oil↑)", "Negative (oil↓)"])
+ax.set_ylabel("Number of events (pre-2026)")
+ax.set_title("Event counts by direction")
+ax.legend()
+plt.suptitle("Primary vs Secondary Oil Shock Definitions", fontsize=13)
+save("secondary_shock_overlap.png")
+
+# ── 7r-ii. CAR path comparison by sector ─────────────────────────────────────
+
+_labels_with_sp = {"sp": "S&P 500", **SECTOR_LABELS}
+sector_labels_cmp = {s: _labels_with_sp.get(s, s.upper()) for s in COMPARE_SECTORS}
+fig, axes_ = plt.subplots(len(COMPARE_SECTORS), 2,
+                          figsize=(16, 4*len(COMPARE_SECTORS)), sharex=True)
+x_evt = np.arange(-EVENT_PRE, EVENT_POST + 1)
+
+for row_i, sec in enumerate(COMPARE_SECTORS):
+    ar_col = "_ar_sp" if sec == "sp" else f"_ar_{sec}"
+    lbl    = sector_labels_cmp[sec]
+    for col_i, (subset, def_label, color) in enumerate([
+        (train_rows, "Primary (3y extreme)", "steelblue"),
+        (events_3sig[events_3sig["date"].dt.year < 2026], "Secondary (|ret|>3σ)", "darkorange"),
+    ]):
+        ax = axes_[row_i][col_i]
+        for shock_d, ls in [(1, "-"), (-1, "--")]:
+            sub_d  = subset[subset["shock_dir"] == shock_d]
+            paths  = extract_car_paths(sub_d, ar_col)
+            if len(paths) == 0:
+                continue
+            m = paths.mean(0) * 100
+            s = paths.std(0)  * 100
+            se= s / np.sqrt(len(paths))
+            lbl_d = f"{'Pos' if shock_d==1 else 'Neg'} (n={len(paths)})"
+            c = "darkorange" if shock_d == 1 else "steelblue"
+            ax.plot(x_evt, m, color=c, linewidth=1.8, linestyle=ls, label=lbl_d)
+            ax.fill_between(x_evt, m-2*se, m+2*se, alpha=0.25, color=c)
+        ax.axvline(0, color="black", linewidth=1, linestyle="--")
+        ax.axhline(0, color="black", linewidth=0.5, linestyle=":")
+        ax.set_title(f"{lbl} — {def_label}")
+        ax.set_ylabel("CAR (%)")
+        if row_i == 0:
+            ax.legend(fontsize=8)
+        if row_i == len(COMPARE_SECTORS)-1:
+            ax.set_xlabel("Days relative to shock")
+
+plt.suptitle("CAR Paths: Primary vs Secondary Shock Definition\n"
+             "(S&P, Energy, Cons.Disc, Materials, Utilities)", fontsize=13)
+save("secondary_vs_primary_car.png")
+
+# ── 7r-iii. Mean 22d CAR heatmap comparison ───────────────────────────────────
+
+fig, axes_ = plt.subplots(1, 2, figsize=(12, 5))
+for ax, (subset, def_label) in zip(axes_, [
+    (train_rows, "Primary (3y extreme)"),
+    (events_3sig[events_3sig["date"].dt.year < 2026], "Secondary (|ret|>3σ)"),
+]):
+    hm = {}
+    for shock_d, d_lbl in [(1, "Positive"), (-1, "Negative")]:
+        sub_d = subset[subset["shock_dir"] == shock_d]
+        hm[d_lbl] = {}
+        for sec in COMPARE_SECTORS:
+            col = f"car_{sec}_22"
+            vals = sub_d[col].dropna() * 100 if col in sub_d.columns else pd.Series(dtype=float)
+            hm[d_lbl][sector_labels_cmp[sec]] = vals.mean() if len(vals) >= 3 else np.nan
+    hm_df = pd.DataFrame(hm)
+    vmax  = max(hm_df.abs().max().max(), 0.1)
+    sns.heatmap(hm_df, annot=True, fmt=".2f", cmap="RdYlGn", center=0,
+                vmin=-vmax, vmax=vmax, ax=ax, linewidths=0.5,
+                cbar_kws={"label": "Mean CAR 22d (%)"})
+    n = len(subset)
+    ax.set_title(f"{def_label}  (n={n})")
+plt.suptitle("Mean 22-day Sector CAR: Primary vs Secondary Definition", fontsize=13)
+save("secondary_car_heatmap.png")
+
+# ── 7s. Macro controls comparison chart ──────────────────────────────────────
+
+comp_rows = []
+for asset, r10_list, r14_list in [
+    ("S&P", results_ext,     results_macro),
+    ("XLE", results_xle_ext, results_macro_xle),
+]:
+    for h in CAR_HORIZONS:
+        r10 = next((r["cv_r2"] for r in r10_list if r["model"] == "Ridge_ext"   and r["horizon"] == h), np.nan)
+        r14 = next((r["cv_r2"] for r in r14_list if r["model"] == "Ridge_macro" and r["horizon"] == h), np.nan)
+        l14 = next((r["cv_r2"] for r in r14_list if r["model"] == "Lasso_macro" and r["horizon"] == h), np.nan)
+        comp_rows.append({"asset": asset, "horizon": f"{h}d",
+                          "Ridge (10f)": r10, "Ridge+macro (14f)": r14, "Lasso+macro (14f)": l14})
+
+comp_df = pd.DataFrame(comp_rows)
+fig, axes_ = plt.subplots(1, 2, figsize=(16, 6), sharey=False)
+for ax, asset in zip(axes_, ["S&P", "XLE"]):
+    sub = comp_df[comp_df["asset"] == asset].set_index("horizon")
+    sub[["Ridge (10f)", "Ridge+macro (14f)", "Lasso+macro (14f)"]].plot(
+        kind="bar", ax=ax, rot=0, alpha=0.85,
+        color=["steelblue", "crimson", "purple"])
+    ax.axhline(0, color="black", linewidth=0.9, linestyle="--")
+    ax.set_xlabel("Horizon")
+    ax.set_ylabel("5-fold CV R²")
+    ax.set_title(f"{asset} CAR — baseline vs macro-augmented")
+    ax.legend(title="Model", fontsize=8)
+    ax.annotate(f"n_macro={len(train_macro)}", xy=(0.02, 0.02),
+                xycoords="axes fraction", fontsize=8, color="grey")
+plt.suptitle("Effect of Adding Macro Controls (LQD, DXY, Term Spread, VIX Δ)\n"
+             "on CV R² — Ridge and Lasso", fontsize=13)
+save("macro_controls_comparison.png")
+
+# Lasso non-zero coefficient plot (XLE 1d)
+if xle_1d_lasso and xle_1d_lasso["coefs"]:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    coef_s = pd.Series(xle_1d_lasso["coefs"]).sort_values()
+    colors = ["firebrick" if v < 0 else "steelblue" for v in coef_s]
+    coef_s.plot(kind="barh", ax=ax, color=colors, alpha=0.85)
+    ax.axvline(0, color="black", linewidth=0.8)
+    ax.set_title("Lasso_macro: non-zero coefficients for XLE CAR(1d)\n"
+                 "(standardised features — shows which macro variables are selected)")
+    ax.set_xlabel("Coefficient")
+    save("lasso_macro_coefs_xle_1d.png")
+
+# ── 7s. Full history: cumulative returns + shock events ───────────────────────
 
 xle_start_loc = df.loc[df["ret_xle"].notna()].index[0]
 sub_hist = df.loc[xle_start_loc:].copy().reset_index(drop=True)
@@ -1082,5 +1781,82 @@ if len(df_2026) > 0 and len(events_2026) > 0:
 
     plt.suptitle("2026: Oil Shocks — Market Evolution and Model Predictions", fontsize=13)
     save("market_2026_with_predictions.png")
+
+# ── 7p. 2026 full-sector comparison: expected (training mean) vs actual ───────
+# This is the central deliverable of the project — how well did the model
+# predict what actually happened across ALL affected markets.
+
+_events_2026 = events[events["date"].dt.year >= 2026].copy()
+_train_rows  = events[events["date"].dt.year < 2026]
+
+if len(_events_2026) > 0:
+    ev26      = _events_2026.iloc[0]
+    sd26      = int(ev26["shock_dir"])
+    train_dir = _train_rows[_train_rows["shock_dir"] == sd26]
+    dir_lbl   = "positive (3y-high)" if sd26 == 1 else "negative (3y-low)"
+
+    # Build expected vs actual table — S&P first, then all sectors
+    _all_compare = [("sp", "S&P 500")] + [(s, SECTOR_LABELS[s]) for s in ALL_SECTORS]
+    comp_rows = []
+    for sec, lbl in _all_compare:
+        for h in CAR_HORIZONS:
+            col = f"car_{sec}_{h}"
+            exp = train_dir[col].dropna().mean() * 100 if col in train_dir.columns else np.nan
+            act = float(ev26[col]) * 100 if (col in ev26.index and pd.notna(ev26.get(col, np.nan))) else np.nan
+            comp_rows.append({"sector": lbl, "sec_code": sec,
+                               "horizon": h, "expected": exp, "actual": act})
+    comp_df = pd.DataFrame(comp_rows)
+
+    # Print table
+    print(f"\n=== March 9, 2026 — Expected vs Actual CAR across all sectors ===")
+    print(f"Shock type: {dir_lbl}  |  ret_oil = {ev26['ret_oil']*100:.1f}%  |  "
+          f"Training mean based on {len(train_dir)} similar events")
+    header = f"{'Sector':12s}  {'Exp 1d':>7s}  {'Act 1d':>7s}  {'Exp 5d':>7s}  {'Act 5d':>7s}  {'Exp 22d':>8s}  {'Act 22d':>8s}"
+    print(header)
+    print("-" * len(header))
+    def fmt(v): return f"{v:+7.2f}%" if pd.notna(v) else "    n/a"
+    for sec, lbl in _all_compare:
+        row = {}
+        for h in CAR_HORIZONS:
+            sub = comp_df[(comp_df["sec_code"] == sec) & (comp_df["horizon"] == h)]
+            row[h] = sub.iloc[0] if len(sub) else {"expected": np.nan, "actual": np.nan}
+        sep = "─" * len(header) if sec == "xle" else ""
+        if sep: print(sep)
+        print(f"{lbl:12s}  {fmt(row[1]['expected'])}  {fmt(row[1]['actual'])}  "
+              f"{fmt(row[5]['expected'])}  {fmt(row[5]['actual'])}  "
+              f"{fmt(row[22]['expected'])}  {fmt(row[22]['actual'])}")
+
+    # ── Plot: expected vs actual bar chart by sector and horizon ─────────────
+    fig, axes_ = plt.subplots(1, len(CAR_HORIZONS), figsize=(20, 7), sharey=False)
+    for ax, h in zip(axes_, CAR_HORIZONS):
+        sub = comp_df[comp_df["horizon"] == h].copy()
+        sub = sub.sort_values("expected", ascending=False).reset_index(drop=True)
+        n   = len(sub)
+        x   = np.arange(n)
+        w   = 0.38
+        ax.bar(x - w/2, sub["expected"].fillna(0), w,
+               color="steelblue", alpha=0.8, label="Expected\n(training mean)")
+        bar_colors = ["forestgreen" if pd.notna(v) and v >= 0 else "firebrick"
+                      for v in sub["actual"]]
+        ax.bar(x + w/2, sub["actual"].fillna(0), w,
+               color=bar_colors, alpha=0.8, label="Actual\n(Mar 9, 2026)")
+        # Mark NaN actuals
+        for i, v in enumerate(sub["actual"]):
+            if pd.isna(v):
+                ax.text(x[i] + w/2, 0.1, "n/a", ha="center", va="bottom", fontsize=7, color="grey")
+        ax.axhline(0, color="black", linewidth=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels(sub["sector"], rotation=45, ha="right", fontsize=8)
+        ax.set_ylabel("CAR (%)")
+        ax.set_title(f"{h}-day CAR")
+        if h == CAR_HORIZONS[0]:
+            ax.legend(fontsize=9, loc="upper right")
+
+    plt.suptitle(
+        f"March 9, 2026 Oil Shock: Expected vs Actual CAR — All 11 Sectors\n"
+        f"({dir_lbl}  |  oil return {ev26['ret_oil']*100:.1f}%  |  "
+        f"expected = mean of {len(train_dir)} training events with same shock direction)",
+        fontsize=12)
+    save("2026_sector_comparison.png")
 
 print(f"\nAll plots saved to ./{OUTDIR}/")
